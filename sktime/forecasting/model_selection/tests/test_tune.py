@@ -543,10 +543,26 @@ class _PretrainedRequiredDummy(DummyGlobalForecaster):
 
 
 @pytest.mark.skipif(
-    not run_test_for_class([ForecastingGridSearchCV, DummyGlobalForecaster]),
+    not run_test_for_class(
+        [ForecastingGridSearchCV, ForecastingRandomizedSearchCV, DummyGlobalForecaster]
+    ),
     reason="run test only if softdeps are present and incrementally (if requested)",
 )
-def test_gscv_preserves_pretrained_state():
+@pytest.mark.parametrize(
+    "Tuner, search_kwargs",
+    [
+        (ForecastingGridSearchCV, {"param_grid": {"strategy": ["mean", "last"]}}),
+        (
+            ForecastingRandomizedSearchCV,
+            {
+                "param_distributions": {"strategy": ["mean", "last"]},
+                "n_iter": 2,
+                "random_state": 0,
+            },
+        ),
+    ],
+)
+def test_tuner_preserves_pretrained_state(Tuner, search_kwargs):
     """Tuners must retain pretrained state when cloning and setting params.
 
     ``clone().set_params()`` calls skbase ``reset()``, which drops pretrained
@@ -566,20 +582,68 @@ def test_gscv_preserves_pretrained_state():
     forecaster.pretrain(y_panel)
     pretrain_mean = forecaster.global_mean_
 
-    gscv = ForecastingGridSearchCV(
+    tuner = Tuner(
         forecaster,
-        param_grid={"strategy": ["mean", "last"]},
         cv=SingleWindowSplitter(fh=1),
         error_score="raise",
         refit=False,
         return_n_best_forecasters=2,
+        **search_kwargs,
+    )
+    tuner.fit(y)
+
+    assert tuner.best_forecaster_.state == "pretrained"
+    assert hasattr(tuner.best_forecaster_, "global_mean_")
+    np.testing.assert_almost_equal(tuner.best_forecaster_.global_mean_, pretrain_mean)
+
+    for _, tuned in tuner.n_best_forecasters_:
+        assert tuned.state == "pretrained"
+        np.testing.assert_almost_equal(tuned.global_mean_, pretrain_mean)
+
+
+@pytest.mark.skipif(
+    not run_test_for_class(
+        [
+            ForecastingGridSearchCV,
+            TransformedTargetForecaster,
+            NaiveForecaster,
+            PolynomialTrendForecaster,
+        ]
+    ),
+    reason="run test only if softdeps are present and incrementally (if requested)",
+)
+def test_gscv_evaluates_named_step_estimator_candidates():
+    """Grid search over a pipeline step name must evaluate each estimator.
+
+    ``_set_params_at`` used to ignore heterogeneous step names, so
+    ``param_grid={"f": [NaiveForecaster(), PolynomialTrendForecaster()]}``
+    scored ``NaiveForecaster`` twice. Both candidates must actually be
+    swapped into the pipeline.
+    """
+    y = load_airline()[:36]
+    pipe = TransformedTargetForecaster(
+        [
+            ("t", Detrender(PolynomialTrendForecaster())),
+            ("f", NaiveForecaster()),
+        ]
+    )
+    scoring = MeanAbsolutePercentageError(symmetric=True)
+    gscv = ForecastingGridSearchCV(
+        pipe,
+        cv=SingleWindowSplitter(fh=1),
+        param_grid={"f": [NaiveForecaster(), PolynomialTrendForecaster()]},
+        scoring=scoring,
+        return_n_best_forecasters=2,
+        refit=False,
     )
     gscv.fit(y)
 
-    assert gscv.best_forecaster_.state == "pretrained"
-    assert hasattr(gscv.best_forecaster_, "global_mean_")
-    np.testing.assert_almost_equal(gscv.best_forecaster_.global_mean_, pretrain_mean)
+    candidate_types = {type(dict(fc.steps)["f"]) for _, fc in gscv.n_best_forecasters_}
+    assert candidate_types == {NaiveForecaster, PolynomialTrendForecaster}
 
-    for _, tuned in gscv.n_best_forecasters_:
-        assert tuned.state == "pretrained"
-        np.testing.assert_almost_equal(tuned.global_mean_, pretrain_mean)
+    best_f = dict(gscv.best_forecaster_.steps)["f"]
+    assert type(best_f) in (NaiveForecaster, PolynomialTrendForecaster)
+
+    scores = list(gscv.cv_results_[f"mean_test_{scoring.name}"])
+    assert len(scores) == 2
+    assert scores[0] != scores[1]
